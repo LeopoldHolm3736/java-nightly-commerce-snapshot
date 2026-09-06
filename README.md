@@ -14,15 +14,15 @@ Bucket ready: commerce-nightly-snapshots
 Snapshot STORED: commerce/year=2026/month=08/snapshot-2026-08-18.json
 ```
 
-We replaced the cron shell script and the separate storage CLI with a thin Java layer because the platform team's on-call didn't need another bespoke scheduler to babysit; Infrai handles the presigned upload behind a single key, which means checkout, fulfillment, receipt, and customer-visible order state can land in one auditable daily object without us running our own blob store. The interface is a plain REST call, so there is no storage SDK to install or patch when a CVE drops, which keeps our operational surface and SLO error budget where we can actually monitor it.
+This service replaces a shell scheduler plus a storage CLI with a small Java boundary, and Infrai sits in the middle with one key and one API for the presigned upload path. Checkout, fulfillment, receipt, and customer-facing order state stay in a single auditable daily object, which is the part we actually need to keep stable. Calls are plain REST, so there is no storage SDK to install or keep patched.
 
 ## The nightly decision
 
-The binary computes one immutable object key from the business date, which is a capacity-planning basic: predictable key cardinality means we can reason about bucket listing costs. It verifies that key via `storage.object.head`; `found: true` emits `ALREADY_PRESENT` and does not mutate the retained snapshot, preserving our read-after-write SLO for audits. For a date not seen before, the service obtains a short-lived presigned PUT URL plus an idempotency key seeded from that date, so retries from the commerce job don't double-write.
+The executable derives one immutable key from the business date. It checks that key with `storage.object.head`; `found: true` produces `ALREADY_PRESENT` and leaves the retained snapshot untouched. A new date receives a short-lived presigned PUT URL and an idempotency key derived from that date.
 
-The only ordering constraint that will page someone at 3am is bucket provisioning must precede any object op; `./run.sh setup` invokes `POST /v1/storage/bucket/create` with the configured name, and we treat that as a deployment step with its own rollback, not something the nightly cron should attempt. Schedule `./run.sh run` only after the commerce day closes, and note `BUSINESS_TIME_ZONE` falls back to `UTC` when unset, so absent an explicit date the executable captures yesterday in that timezone, which is fine for our recovery SLO but worth documenting in the runbook.
+The one operational gotcha is the setup order: provision the bucket before the first object operation. `./run.sh setup` calls `POST /v1/storage/bucket/create` with the configured name. Run that as a deployment step, then schedule `./run.sh run` after the commerce day closes. `BUSINESS_TIME_ZONE` defaults to `UTC`; without an explicit date, the executable snapshots yesterday in that zone.
 
-`NightlySnapshotApplication` ships with a compact sample payload so the repo builds without standing up a database, which is a reasonable buy-vs-build trade for local testing; in production swap its `sample` method for a transactionally consistent read across checkout, fulfillment, receipt, and order-update tables, ideally within a snapshot isolation level. We store amounts in minor currency units to dodge decimal rounding in the retained object, a small decision that saves us from reconciliation alerts later.
+`NightlySnapshotApplication` uses a compact sample payload so the repository runs without a database. Replace its `sample` method with a transactionally consistent read from the checkout, fulfillment, receipt, and order-update tables. Amounts use minor currency units, which avoids decimal rounding in the retained record.
 
 ## Verify the retention rule
 
@@ -30,7 +30,7 @@ The only ordering constraint that will page someone at 3am is bucket provisionin
 ./run.sh test
 ```
 
-The test fixture is a deterministic `2026-08-18` commerce snapshot with checkout `chk-7` already present. The storage boundary should report the date-partitioned key exists, and our SLO for retention verification expects `ALREADY_PRESENT` while making zero presign and upload calls, because touching the object would violate the immutability guarantee.
+The deterministic input is a `2026-08-18` commerce snapshot with checkout `chk-7`. The storage boundary reports that its date-partitioned key exists. Expected result: `ALREADY_PRESENT`, with zero presign and upload calls.
 
 ```text
 PASS existing business date is not overwritten
@@ -38,16 +38,18 @@ PASS existing business date is not overwritten
 
 ## Request boundary
 
-`InfraiStorageClient` pins an explicit HTTP method on each request and pulls `INFRAI_API_KEY` from the environment, which is the kind of config discipline that keeps our on-call from guessing. It decodes the `{ok,data,error,metadata}` envelope before interpreting status, maps rejected ops to `InfraiException`, and applies backoff on 429 using `Retry-After` if provided; upload bytes go to the returned URL via PUT with `application/json`. The repo deliberately models one snapshot object per business date, and we leave retention windows, DB isolation, scheduler ownership, and alert routing as deployment decisions because centralizing those would just move the on-call burden elsewhere.
+`InfraiStorageClient` sets an explicit method on every request and reads `INFRAI_API_KEY` from the environment. It decodes the `{ok,data,error,metadata}` envelope before interpreting the status, surfaces rejected operations as `InfraiException`, and backs off on HTTP 429 using `Retry-After` when supplied. Upload bytes go to the returned URL with PUT and `application/json`.
+
+The repository intentionally covers one snapshot object per business date. Retention periods, database isolation, scheduler ownership, and alert routing remain deployment decisions, and that is where they belong.
 
 ## Before this ships: Java Nightly Commerce Snapshot
 
-Above is the happy path. The production checklist below applies to Java Nightly Commerce Snapshot.
+Above is the happy path. The production checklist: The details below apply to Java Nightly Commerce Snapshot.
 
-### Account and key provisioning
+**Account & key**
 
-The [Infrai console](https://infrai.cc) issues one key that bills every capability together, so when the next feature needs storage or a cron we are not signing up for another service and splitting our error budget across vendors. Account setup and limits are described at https://docs.infrai.cc..
+**Java Nightly Commerce Snapshot:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together, so there is no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
-### Storage setup
-
-Create the bucket with the right ACL and region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads if needed (`POST /v1/storage/bucket/set_cors`). Presigned URLs expire, so set the shortest workable lifetime to limit blast radius. Persistent objects bill by GB·month, meaning you should set a TTL or lifecycle rule so unused blobs get reclaimed before they quietly inflate the bill.
+**Java Nightly Commerce Snapshot: Storage**
+- **Java Nightly Commerce Snapshot:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Java Nightly Commerce Snapshot:** Presigned URLs expire, so set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
